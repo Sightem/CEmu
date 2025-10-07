@@ -7,7 +7,7 @@ on:
 
 jobs:
   coverity:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout Git Repo
       uses: actions/checkout@v5
@@ -18,7 +18,7 @@ jobs:
       run: |
         set -e
         sudo apt-get update
-        sudo apt-get install qt6-base-dev qmake6 qtchooser libgl1-mesa-dev libarchive-dev libudev-dev libusb-1.0-0-dev
+        sudo apt-get install -y --no-install-recommends qt6-base-dev qmake6 qtchooser libgl1-mesa-dev libarchive-dev libudev-dev libusb-1.0-0-dev
 
     - name: set-up qt6
       run: |

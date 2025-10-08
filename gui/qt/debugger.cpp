@@ -2203,6 +2203,7 @@ HexWidget *MainWindow::gotoMemAddrNoRaise(uint32_t address) {
             const int offset = static_cast<int>(address - edit->getBase());
             if (offset < edit->getSize()) {
                 edit->setOffset(offset);
+                edit->setHighlight(static_cast<int>(address));
                 memWidget = edit;
                 didGoto = true;
                 break;
@@ -2217,6 +2218,8 @@ HexWidget *MainWindow::gotoMemAddrNoRaise(uint32_t address) {
     }
     if (memWidget != Q_NULLPTR && !didGoto) {
         memGoto(memWidget, address);
+    } else if (memWidget != Q_NULLPTR) {
+        memWidget->setHighlight(static_cast<int>(address));
     }
     return memWidget;
 }

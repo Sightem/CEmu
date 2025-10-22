@@ -8,6 +8,26 @@
 # define __has_builtin(x) 0
 #endif
 
+#ifndef ALWAYS_INLINE
+# ifdef __cplusplus
+#  if defined(_MSC_VER)
+#   define ALWAYS_INLINE __forceinline
+#  elif __has_attribute(always_inline) || defined(__GNUC__)
+#   define ALWAYS_INLINE inline __attribute__((always_inline))
+#  else
+#   define ALWAYS_INLINE inline
+#  endif
+# else /* C */
+#  if defined(_MSC_VER)
+#   define ALWAYS_INLINE __forceinline static
+#  elif __has_attribute(always_inline) || defined(__GNUC__)
+#   define ALWAYS_INLINE static inline __attribute__((always_inline))
+#  else
+#   define ALWAYS_INLINE static inline
+#  endif
+# endif
+#endif
+
 #ifndef __cplusplus
 # if __has_attribute(fallthrough)
 #  define fallthrough __attribute__((fallthrough))

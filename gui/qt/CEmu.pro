@@ -237,6 +237,7 @@ SOURCES += \
     ../../core/spi.c \
     ../../core/uart.c \
     ../../core/debug/debug.c \
+    ../../core/debug/memtrace.c \
     ../../core/debug/zdis/zdis.c \
     ipc.cpp \
     main.cpp \
@@ -345,6 +346,7 @@ HEADERS  += \
     ../../core/panel.h \
     ../../core/spi.h \
     ../../core/debug/debug.h \
+    ../../core/debug/memtrace.h \
     ../../core/debug/zdis/zdis.h \
     ipc.h \
     utils.h \

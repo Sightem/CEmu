@@ -161,6 +161,9 @@ MainWindow::MainWindow(CEmuOpts &cliOpts, QWidget *p) : QMainWindow(p), ui(new U
     connect(&emu, &EmuThread::sendSpeed, this, &MainWindow::showEmuSpeed, Qt::QueuedConnection);
     connect(&emu, &EmuThread::debugDisable, this, &MainWindow::debugDisable, Qt::QueuedConnection);
     connect(&emu, &EmuThread::debugCommand, this, &MainWindow::debugCommand, Qt::QueuedConnection);
+    // live RAM change tracking
+    connect(&emu, &EmuThread::memDirty, this, &MainWindow::onMemDirty, Qt::QueuedConnection);
+    connect(&emu, &EmuThread::memDirtyData, this, &MainWindow::onMemDirtyData, Qt::QueuedConnection);
     connect(&emu, &EmuThread::saved, this, &MainWindow::emuSaved, Qt::QueuedConnection);
     connect(&emu, &EmuThread::loaded, this, &MainWindow::emuCheck, Qt::QueuedConnection);
     connect(&emu, &EmuThread::blocked, this, &MainWindow::emuBlocked, Qt::QueuedConnection);

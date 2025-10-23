@@ -6,6 +6,7 @@
 #include "../../core/emu.h"
 #include "../../core/extras.h"
 #include "../../core/link.h"
+#include "../../core/mem.h"
 #include "../../tests/autotester/autotester.h"
 #include "../../tests/autotester/crc32.hpp"
 #include "capture/animated-png.h"
@@ -17,6 +18,7 @@
 #include <cassert>
 #include <cstdarg>
 #include <thread>
+ 
 
 static EmuThread *emu;
 
@@ -219,6 +221,55 @@ void EmuThread::doStuff() {
         QMutexLocker locker(&m_keyQueueMutex);
         while (!m_keyQueue.isEmpty() && sendKey(m_keyQueue.head())) {
             m_keyQueue.dequeue();
+        }
+    }
+
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_lastMemDirtyEmit >= std::chrono::milliseconds(16)) {
+            m_lastMemDirtyEmit = now;
+            QVector<uint32_t> starts;
+            QVector<uint32_t> lens;
+            starts.reserve(256);
+            lens.reserve(256);
+            struct Ctx { QVector<uint32_t> *s; QVector<uint32_t> *l; } ctx{&starts, &lens};
+            auto cb = [](uint32_t a, uint32_t n, void *c) {
+                auto *p = static_cast<Ctx*>(c);
+                if (n) { p->s->push_back(a); p->l->push_back(n); }
+            };
+
+            mem_live_swap_iter_ram(cb, &ctx);
+            mem_live_swap_iter_flash(cb, &ctx);
+
+            if (!starts.isEmpty()) {
+                size_t total = 0;
+                for (const unsigned int len : lens)
+                    total += len;
+
+                QByteArray blob;
+                blob.resize(static_cast<int>(total));
+                char *dst = blob.data();
+                for (int i = 0; i < starts.size(); ++i) {
+                    const uint32_t abs = starts[i];
+                    const uint32_t len = lens[i];
+
+                    if (!len)
+                        continue;
+
+                    if (abs >= 0xD00000u && abs < 0xD00000u + SIZE_RAM) {
+                        const uint32_t off = abs - 0xD00000u;
+                        memcpy(dst, &mem.ram.block[off], len);
+                    } else {
+                        // flash absolute region: 0x000000..SIZE_FLASH-1
+                        Q_ASSERT(abs < SIZE_FLASH);
+                        memcpy(dst, &mem.flash.block[abs], len);
+                    }
+                    dst += len;
+                }
+                emit memDirty(starts, lens);
+                emit memDirtyData(starts, lens, blob);
+                // TODO if m_traceEnabled append an event containing starts/lens/blob and timestamp
+            }
         }
     }
 }

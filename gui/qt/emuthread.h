@@ -92,6 +92,10 @@ signals:
     void blocked(int req);
     void linkProgress(int value, int total);
 
+    // live RAM change tracking
+    void memDirty(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens);
+    void memDirtyData(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens, const QByteArray &data);
+
 public slots:
     void send(const QStringList &names, int location);
     void cancelTransfer();
@@ -157,6 +161,9 @@ private:
 
     std::chrono::steady_clock::time_point m_perfArray[PerfArraySize];
     size_t m_perfIndex = 0;
+
+    // live RAM change tracking emit throttle
+    std::chrono::steady_clock::time_point m_lastMemDirtyEmit{std::chrono::steady_clock::now()};
 };
 
 #endif

@@ -2,9 +2,12 @@
 #define HEXWIDGET_H
 
 #include <QtCore/QPoint>
+#include <QtCore/QByteArray>
 #include <QtCore/QStack>
+#include <QtCore/QVector>
 #include <QtWidgets/QWidget>
 #include <QtWidgets/QAbstractScrollArea>
+#include <QtGui/QPaintEvent>
 
 class HexWidget : public QAbstractScrollArea {
     Q_OBJECT
@@ -23,6 +26,8 @@ public:
     void setOffset(int addr);
     void prependData(const QByteArray &ba);
     void appendData(const QByteArray &ba);
+    void setCpuDirtyRangesAbs(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens);
+    void applyCpuBytesAbs(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens, const QByteArray &data);
     int getBase() const { return m_base; }
     int getOffset() const { return m_cursorOffset / 2; }
     int getCursorOffset() const { return m_cursorOffset; }
@@ -90,6 +95,7 @@ private:
 
     QByteArray m_data;
     QByteArray m_modified;
+    QByteArray m_cpuDirty; // per-byte flags for CPU writes since last tick
     int m_size;
     int m_maxOffset;
 

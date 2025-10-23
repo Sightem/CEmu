@@ -1,3 +1,4 @@
+#include "defines.h"
 #include "mem.h"
 #include "emu.h"
 #include "cpu.h"
@@ -6,6 +7,7 @@
 #include "flash.h"
 #include "control.h"
 #include "debug/debug.h"
+#include "debug/memtrace.h"
 
 #include <assert.h>
 #include <string.h>
@@ -22,6 +24,225 @@ static uint8_t (*mem_read_flash)(uint32_t);
 
 static uint8_t mem_read_flash_parallel(uint32_t);
 static uint8_t mem_read_flash_serial(uint32_t);
+
+/*
+ * Live RAM change tracking
+ */
+#define RAM_ABS_BASE   0xD00000u
+#define RAM_ABS_LIMIT  (RAM_ABS_BASE + SIZE_RAM)
+#define RAM_PAGE_SHIFT 12
+#define RAM_PAGE_SIZE  (1u << RAM_PAGE_SHIFT)
+#define RAM_PAGE_MASK  (RAM_PAGE_SIZE - 1u)
+#define RAM_NUM_PAGES  ((SIZE_RAM + RAM_PAGE_MASK) >> RAM_PAGE_SHIFT)
+
+/* two buffers of [page][64 words of 64 bits] => 4096 bits/page */
+static uint64_t ram_dirty_a[RAM_NUM_PAGES][64];
+static uint64_t ram_dirty_b[RAM_NUM_PAGES][64];
+static uint64_t (*ram_dirty_front)[64] = ram_dirty_a;
+static uint64_t (*ram_dirty_back)[64]  = ram_dirty_b;
+
+ALWAYS_INLINE void ram_dirty_mark_byte(uint32_t ram_off) {
+    /* ram_off is 0..SIZE_RAM-1 */
+    const uint32_t page = ram_off >> RAM_PAGE_SHIFT;
+    const uint32_t bit  = ram_off & RAM_PAGE_MASK;        /* 0..4095 */
+    const uint32_t word = bit >> 6;                       /* 0..63 */
+    const uint64_t mask = 1ull << (bit & 63);             /* bit in word */
+    ram_dirty_front[page][word] |= mask;
+}
+
+ALWAYS_INLINE void ram_dirty_mark_range(uint32_t ram_off, uint32_t len) {
+    /* [ram_off, ram_off+len) */
+    while (len) {
+        const uint32_t page = ram_off >> RAM_PAGE_SHIFT;
+        const uint32_t in_page = ram_off & RAM_PAGE_MASK;           /* 0..4095 */
+        const uint32_t room = RAM_PAGE_SIZE - in_page;              /* bytes left in page */
+        uint32_t chunk = len < room ? len : room;
+
+        uint32_t bit = in_page;             /* starting bit index in page */
+        uint32_t word = bit >> 6;           /* word index */
+        const uint32_t bit_in_word = bit & 63;    /* bit offset in word */
+
+        if (bit_in_word) {
+            const uint32_t span = (64 - bit_in_word);
+            const uint32_t take = (chunk < span ? chunk : span);
+            const uint64_t mask = ((take == 64) ? ~0ull : ((1ull << take) - 1ull)) << bit_in_word;
+            ram_dirty_front[page][word] |= mask;
+            bit += take; word += 1; chunk -= take;
+        }
+
+        while (chunk >= 64) {
+            ram_dirty_front[page][word++] |= ~0ull;
+            chunk -= 64;
+        }
+
+        if (chunk) {
+            uint64_t mask = (1ull << chunk) - 1ull;
+            ram_dirty_front[page][word] |= mask;
+        }
+
+        ram_off = (page + 1u) << RAM_PAGE_SHIFT;
+        len -= (room < len ? room : len);
+    }
+}
+
+void mem_live_mark_ram(const uint32_t abs_addr) {
+    /* current callers ensure RAM address so this is just an assert */
+    assert(abs_addr >= RAM_ABS_BASE && abs_addr < RAM_ABS_LIMIT);
+    const uint32_t ram_off = abs_addr - RAM_ABS_BASE;
+    ram_dirty_mark_byte(ram_off);
+}
+
+void mem_live_mark_ram_range(uint32_t abs_addr, uint32_t len) {
+    assert(len > 0);
+    uint32_t end = abs_addr + len; /* exclusive */
+    assert(end > abs_addr);
+    assert(abs_addr >= RAM_ABS_BASE);
+    assert(end <= RAM_ABS_LIMIT);
+
+    ram_dirty_mark_range(abs_addr - RAM_ABS_BASE, len);
+}
+
+void mem_live_swap_iter_ram(mem_live_iter_cb cb, void *ctx) {
+    /* swap buffers */
+    uint64_t (*old_front)[64] = ram_dirty_front;
+    ram_dirty_front = ram_dirty_back;
+    ram_dirty_back  = old_front;
+
+    memset(ram_dirty_front, 0, sizeof(ram_dirty_a));
+
+    for (uint32_t page = 0; page < RAM_NUM_PAGES; ++page) {
+        uint64_t *words = ram_dirty_back[page];
+        const uint32_t base_abs = RAM_ABS_BASE + (page << RAM_PAGE_SHIFT);
+        for (uint32_t widx = 0; widx < 64; ++widx) {
+            uint64_t w = words[widx];
+            while (w) {
+                /* find first set bit */
+                uint32_t l = 0;
+                while (((w >> l) & 1ull) == 0ull) { ++l; }
+                /* count consecutive ones starting at l within this word */
+                uint32_t len = 0;
+                while ((l + len) < 64 && ((w >> (l + len)) & 1ull)) { ++len; }
+                cb(base_abs + (widx << 6) + l, len, ctx);
+                /* clear processed bits in local copy */
+                uint64_t mask = ((len == 64) ? ~0ull : ((1ull << len) - 1ull)) << l;
+                w &= ~mask;
+            }
+        }
+
+        memset(words, 0, sizeof(ram_dirty_back[page]));
+    }
+}
+
+/*
+ * Live FLASH change tracking
+ *
+ */
+
+#define FLASH_ABS_BASE   0x000000u
+#define FLASH_ABS_LIMIT  (FLASH_ABS_BASE + SIZE_FLASH)
+#define FLASH_PAGE_SHIFT 12
+#define FLASH_PAGE_SIZE  (1u << FLASH_PAGE_SHIFT)
+#define FLASH_PAGE_MASK  (FLASH_PAGE_SIZE - 1u)
+#define FLASH_NUM_PAGES  ((SIZE_FLASH + FLASH_PAGE_MASK) >> FLASH_PAGE_SHIFT)
+
+/* two buffers of [page][64 words of 64 bits] 4096 bits/page */
+static uint64_t flash_dirty_a[FLASH_NUM_PAGES][64];
+static uint64_t flash_dirty_b[FLASH_NUM_PAGES][64];
+static uint64_t (*flash_dirty_front)[64] = flash_dirty_a;
+static uint64_t (*flash_dirty_back)[64]  = flash_dirty_b;
+
+ALWAYS_INLINE void flash_dirty_mark_byte(uint32_t flash_off) {
+    /* flash_off is 0..SIZE_FLASH-1 */
+    const uint32_t page = flash_off >> FLASH_PAGE_SHIFT;
+    const uint32_t bit  = flash_off & FLASH_PAGE_MASK;        /* 0..4095 */
+    const uint32_t word = bit >> 6;                           /* 0..63 */
+    const uint64_t mask = 1ull << (bit & 63);                 /* bit in word */
+    flash_dirty_front[page][word] |= mask;
+}
+
+ALWAYS_INLINE void flash_dirty_mark_range(uint32_t flash_off, uint32_t len) {
+    /* [flash_off, flash_off+len) */
+    while (len) {
+        const uint32_t page = flash_off >> FLASH_PAGE_SHIFT;
+        const uint32_t in_page = flash_off & FLASH_PAGE_MASK;         /* 0..4095 */
+        const uint32_t room = FLASH_PAGE_SIZE - in_page;               /* bytes left in page */
+        uint32_t chunk = len < room ? len : room;
+
+        uint32_t bit = in_page;             /* starting bit index in page */
+        uint32_t word = bit >> 6;           /* word index */
+        const uint32_t bit_in_word = bit & 63;    /* bit offset in word */
+
+        if (bit_in_word) {
+            const uint32_t span = (64 - bit_in_word);
+            const uint32_t take = (chunk < span ? chunk : span);
+            const uint64_t mask = ((take == 64) ? ~0ull : ((1ull << take) - 1ull)) << bit_in_word;
+            flash_dirty_front[page][word] |= mask;
+            bit += take; word += 1; chunk -= take;
+        }
+
+        while (chunk >= 64) {
+            flash_dirty_front[page][word++] |= ~0ull;
+            chunk -= 64;
+        }
+
+        if (chunk) {
+            const uint64_t mask = (1ull << chunk) - 1ull;
+            flash_dirty_front[page][word] |= mask;
+        }
+
+        flash_off = (page + 1u) << FLASH_PAGE_SHIFT;
+        len -= (room < len ? room : len);
+    }
+}
+
+void mem_live_mark_flash(const uint32_t abs_addr) {
+    assert(abs_addr >= FLASH_ABS_BASE && abs_addr < FLASH_ABS_LIMIT);
+    const uint32_t off = abs_addr - FLASH_ABS_BASE;
+    flash_dirty_mark_byte(off);
+}
+
+void mem_live_mark_flash_range(const uint32_t abs_addr, const uint32_t len) {
+    assert(len > 0);
+    uint32_t end = abs_addr + len; /* exclusive */
+    assert(end > abs_addr);
+    assert(abs_addr >= FLASH_ABS_BASE);
+    assert(end <= FLASH_ABS_LIMIT);
+    flash_dirty_mark_range(abs_addr - FLASH_ABS_BASE, len);
+}
+
+void mem_live_swap_iter_flash(mem_live_iter_cb cb, void *ctx) {
+    /* swap buffers */
+    uint64_t (*old_front)[64] = flash_dirty_front;
+    flash_dirty_front = flash_dirty_back;
+    flash_dirty_back  = old_front;
+
+    memset(flash_dirty_front, 0, sizeof(flash_dirty_a));
+
+    for (uint32_t page = 0; page < FLASH_NUM_PAGES; ++page) {
+        uint64_t *words = flash_dirty_back[page];
+        const uint32_t base_abs = FLASH_ABS_BASE + (page << FLASH_PAGE_SHIFT);
+        for (uint32_t widx = 0; widx < 64; ++widx) {
+            uint64_t w = words[widx];
+            while (w) {
+                /* find first set bit */
+                uint32_t l = 0;
+                while (((w >> l) & 1ull) == 0ull) { ++l; }
+
+                /* count consecutive ones starting at l within this word */
+                uint32_t run = 0;
+                while ((l + run) < 64 && ((w >> (l + run)) & 1ull)) { ++run; }
+                cb(base_abs + (widx << 6) + l, run, ctx);
+
+                /* clear processed bits in local copy */
+                const uint64_t mask = ((run == 64) ? ~0ull : ((1ull << run) - 1ull)) << l;
+                w &= ~mask;
+            }
+        }
+
+
+        memset(words, 0, sizeof(flash_dirty_back[page]));
+    }
+}
 
 void mem_init(void) {
     unsigned int i;
@@ -169,11 +390,51 @@ void mem_dma_write(const void *buf, uint32_t addr, int32_t size) {
         addr &= 0x07FFFF;
         if (addr + (unsigned int)size > addr && addr + (unsigned int)size <= SIZE_RAM) {
             memcpy(&mem.ram.block[addr], src, (unsigned long)size);
+            mem_live_mark_ram_range(RAM_ABS_BASE + addr, (uint32_t)size);
+            if (unlikely(memtrace_is_enabled())) {
+                uint32_t abs = 0xD00000u + addr;
+                const uint8_t *p = src;
+                uint32_t rem = (uint32_t)size;
+                while (rem) {
+                    if (unlikely(memtrace_is_page_tracked(abs))) {
+                        /* tracked */
+                    } else {
+                        uint32_t skip = 0x1000u - (abs & 0xFFFu);
+                        if (skip > rem) skip = rem;
+                        abs += skip; p += skip; rem -= skip;
+                        continue;
+                    }
+                    uint32_t chunk = 0x1000u - (abs & 0xFFFu);
+                    if (chunk > rem) chunk = rem;
+                    memtrace_emit_run(abs, p, chunk, (uint32_t)cpu.cycles);
+                    abs += chunk; p += chunk; rem -= chunk;
+                }
+            }
             break;
         }
         if (addr < SIZE_RAM) {
             uint32_t temp_size = SIZE_RAM - addr;
             memcpy(&mem.ram.block[addr], src, temp_size);
+            mem_live_mark_ram_range(RAM_ABS_BASE + addr, temp_size);
+            if (unlikely(memtrace_is_enabled())) {
+                uint32_t abs = 0xD00000u + addr;
+                const uint8_t *p = src;
+                uint32_t rem = temp_size;
+                while (rem) {
+                    if (unlikely(memtrace_is_page_tracked(abs))) {
+                        /* tracked */
+                    } else {
+                        uint32_t skip = 0x1000u - (abs & 0xFFFu);
+                        if (skip > rem) skip = rem;
+                        abs += skip; p += skip; rem -= skip;
+                        continue;
+                    }
+                    uint32_t chunk = 0x1000u - (abs & 0xFFFu);
+                    if (chunk > rem) chunk = rem;
+                    memtrace_emit_run(abs, p, chunk, (uint32_t)cpu.cycles);
+                    abs += chunk; p += chunk; rem -= chunk;
+                }
+            }
             src += temp_size;
             addr += temp_size;
             size -= temp_size;
@@ -204,6 +465,15 @@ static void flash_write(uint32_t addr, uint8_t byte) {
 
     if (valid == true) {
         mem.flash.block[addr] &= byte;
+#ifdef DEBUG_SUPPORT
+        if (unlikely(debug.addr[addr & 0xFFFFFF] & DBG_MASK_WRITE)) {
+            debug_open(DBG_WATCHPOINT_WRITE, addr & 0xFFFFFF);
+        }
+#endif
+        mem_live_mark_flash(addr);
+        if (unlikely(memtrace_is_enabled()))
+            if (unlikely(memtrace_is_page_tracked(addr)))
+                memtrace_emit_byte(addr, mem.flash.block[addr], (uint32_t)cpu.cycles);
     }
 }
 
@@ -227,6 +497,21 @@ static void flash_erase(uint32_t addr, uint8_t byte) {
     }
 
     gui_console_printf("[CEmu] Erased Unlocked Sectors.\n");
+    /* mark whole flash as changed (chip erase) */
+    mem_live_mark_flash_range(0, SIZE_FLASH);
+#ifdef DEBUG_SUPPORT
+    /* if any watched address lies in the erased range, trigger once */
+    for (uint32_t a = 0; a < SIZE_FLASH; ++a) {
+        if (unlikely(debug.addr[a & 0xFFFFFF] & DBG_MASK_WRITE)) {
+            debug_open(DBG_WATCHPOINT_WRITE, a & 0xFFFFFF);
+            break;
+        }
+    }
+#endif
+    if (unlikely(memtrace_is_enabled())) {
+        /* whole flash marked erased */
+        memtrace_emit_erase(0, SIZE_FLASH, (uint32_t)cpu.cycles);
+    }
 }
 
 static void flash_erase_sector(uint32_t addr, uint8_t byte) {
@@ -245,6 +530,29 @@ static void flash_erase_sector(uint32_t addr, uint8_t byte) {
         if ((mem.flash.sector[selected].ipb & mem.flash.sector[selected].dpb) == 1) {
             memset(mem.flash.sector[selected].ptr, 0xff, SIZE_FLASH_SECTOR_64K);
         }
+    }
+    /* mark the erased sector range */
+    {
+        const uint32_t base = (addr < 0x10000) ? (selected * SIZE_FLASH_SECTOR_8K)
+                                         : (selected * SIZE_FLASH_SECTOR_64K);
+        const uint32_t len  = (addr < 0x10000) ? SIZE_FLASH_SECTOR_8K : SIZE_FLASH_SECTOR_64K;
+        mem_live_mark_flash_range(base, len);
+#ifdef DEBUG_SUPPORT
+        /* trigger once if any watched address is within this sector */
+        const uint32_t end = base + len;
+        for (uint32_t a = base; a < end; ++a) {
+            if (unlikely(debug.addr[a & 0xFFFFFF] & DBG_MASK_WRITE)) {
+                debug_open(DBG_WATCHPOINT_WRITE, a & 0xFFFFFF);
+                break;
+            }
+        }
+#endif
+    }
+    if (unlikely(memtrace_is_enabled())) {
+        uint32_t base = (addr < 0x10000) ? (selected * SIZE_FLASH_SECTOR_8K)
+                                         : (selected * SIZE_FLASH_SECTOR_64K);
+        uint32_t len  = (addr < 0x10000) ? SIZE_FLASH_SECTOR_8K : SIZE_FLASH_SECTOR_64K;
+        memtrace_emit_erase(base, len, (uint32_t)cpu.cycles);
     }
 }
 
@@ -774,6 +1082,12 @@ void mem_write_cpu(uint32_t addr, uint8_t value) {
                 ramAddr = addr & 0x7FFFF;
                 if (ramAddr < 0x65800) {
                     mem.ram.block[ramAddr] = value;
+                    /* mark absolute address in RAM */
+                    mem_live_mark_ram(addr);
+                    /* single byte write */
+                    if (unlikely(memtrace_is_enabled()))
+                        if (unlikely(memtrace_is_page_tracked(addr)))
+                            memtrace_emit_byte(addr, value, (uint32_t)cpu.cycles);
                 }
                 break;
 

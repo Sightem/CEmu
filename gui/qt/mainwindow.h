@@ -105,6 +105,9 @@ private slots:
     void usbConnectPhysical(QVariant userData);
 #endif
     void setThemePreference(int index);
+    // live RAM change tracking
+    void onMemDirty(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens);
+    void onMemDirtyData(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens, const QByteArray &data);
 
 protected:
     virtual void changeEvent(QEvent* event) override;

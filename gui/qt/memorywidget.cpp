@@ -323,3 +323,27 @@ void MainWindow::contextMemWidget(const QPoint &pos, uint32_t address) {
         memDocksUpdate();
     }
 }
+
+void MainWindow::onMemDirty(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens) {
+    if (!guiEmuValid || starts.isEmpty()) {
+        return;
+    }
+    const QList<HexWidget*> widgets = findChildren<HexWidget*>();
+    for (HexWidget *w : widgets) {
+        if (!w) continue;
+        w->setCpuDirtyRangesAbs(starts, lens);
+    }
+}
+
+void MainWindow::onMemDirtyData(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens, const QByteArray &data) {
+    if (!guiEmuValid || starts.isEmpty()) {
+        return;
+    }
+    const QList<HexWidget*> widgets = findChildren<HexWidget*>();
+
+    for (HexWidget *w : widgets) {
+        if (!w)
+            continue;
+        w->applyCpuBytesAbs(starts, lens, data);
+    }
+}

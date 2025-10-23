@@ -3,6 +3,7 @@
 #include "cpu.h"
 #include "emu.h"
 #include "mem.h"
+#include "debug/debug.h"
 #include "os/os.h"
 
 #include <assert.h>
@@ -110,7 +111,19 @@ static void flash_finish_command(void) {
 static void flash_erase(uint32_t size) {
     assert(!(size & (size - 1)));
     if (flash.commandStatus[1] & 1 << 1) {
-        memset(&mem.flash.block[flash.commandAddress & (SIZE_FLASH - 1) & -size], 0xFF, size);
+        const uint32_t base = flash.commandAddress & (SIZE_FLASH - 1) & -size;
+        memset(&mem.flash.block[base], 0xFF, size);
+        mem_live_mark_flash_range(base, size);
+#ifdef DEBUG_SUPPORT
+        /* trigger once if any watched address is within the erased range */
+        const uint32_t end = base + size;
+        for (uint32_t a = base; a < end; ++a) {
+            if (unlikely(debug.addr[a & 0xFFFFFF] & DBG_MASK_WRITE)) {
+                debug_open(DBG_WATCHPOINT_WRITE, a & 0xFFFFFF);
+                break;
+            }
+        }
+#endif
     }
     flash_finish_command();
 }
@@ -191,7 +204,16 @@ static uint8_t flash_read_command(bool peek) {
 static void flash_write_command(uint8_t byte) {
     switch (flash.command[0xF]) {
         case 0x32: // Quad Input Page Program
-            mem.flash.block[flash.commandAddress & (SIZE_FLASH - 1)] &= byte;
+            {
+                const uint32_t addr = flash.commandAddress & (SIZE_FLASH - 1);
+                mem.flash.block[addr] &= byte;
+                mem_live_mark_flash(addr);
+#ifdef DEBUG_SUPPORT
+                if (unlikely(debug.addr[addr & 0xFFFFFF] & DBG_MASK_WRITE)) {
+                    debug_open(DBG_WATCHPOINT_WRITE, addr & 0xFFFFFF);
+                }
+#endif
+            }
             flash.commandAddress = (flash.commandAddress & ~0xFF) | ((flash.commandAddress + 1) & 0xFF);
             break;
     }

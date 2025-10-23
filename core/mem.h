@@ -92,6 +92,25 @@ uint8_t mem_read_unmapped_other(bool update);
 uint8_t mem_read_cpu(uint32_t address, bool fetch);
 void mem_write_cpu(uint32_t address, uint8_t value);
 
+/*
+ * live RAM change tracking (always on RAM pages)
+ * - tracks writes to 0xD00000..0xD65800 with 4KB page bitmaps
+ * - double-buffered, swap+iterate should be called periodically on the emu thread
+ */
+typedef void (*mem_live_iter_cb)(uint32_t abs_addr, uint32_t len, void *ctx);
+
+/* swaps producer/consumer buffers and iterate compact (addr,len) RAM ranges that changed since the previous swap. all addresses are absolute */
+void mem_live_swap_iter_ram(mem_live_iter_cb cb, void *ctx);
+
+void mem_live_mark_ram(uint32_t abs_addr);
+
+void mem_live_mark_ram_range(uint32_t abs_addr, uint32_t len);
+
+/* FLASH live change tracking API (absolute addresses in [0, SIZE_FLASH)) */
+void mem_live_swap_iter_flash(mem_live_iter_cb cb, void *ctx);
+void mem_live_mark_flash(uint32_t abs_addr);
+void mem_live_mark_flash_range(uint32_t abs_addr, uint32_t len);
+
 #ifdef __cplusplus
 }
 #endif

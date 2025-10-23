@@ -8,6 +8,7 @@
 #include <QtGui/QPainter>
 #include <QtGui/QClipboard>
 #include <QtGui/QFontDatabase>
+#include <algorithm>
 
 HexWidget::HexWidget(QWidget *parent) : QAbstractScrollArea{parent}, m_data{Q_NULLPTR} {
     QFont monospace = QFontDatabase::systemFont(QFontDatabase::FixedFont);
@@ -31,19 +32,47 @@ void HexWidget::setData(const QByteArray &ba) {
     m_data = ba;
     m_modified.resize(m_data.size());
     m_modified.fill(0);
+    m_cpuDirty.resize(m_data.size());
+    m_cpuDirty.fill(0);
     adjust();
 }
 
 void HexWidget::prependData(const QByteArray &ba) {
     m_data.prepend(ba);
     m_modified.prepend(QByteArray(ba.size(), 0));
+    m_cpuDirty.prepend(QByteArray(ba.size(), 0));
     adjust();
 }
 
 void HexWidget::appendData(const QByteArray &ba) {
     m_data.append(ba);
     m_modified.append(QByteArray(ba.size(), 0));
+    m_cpuDirty.append(QByteArray(ba.size(), 0));
     adjust();
+}
+
+void HexWidget::setCpuDirtyRangesAbs(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens) {
+    if (m_data.isEmpty()) {
+        return;
+    }
+    if (m_cpuDirty.size() != m_data.size()) {
+        m_cpuDirty.resize(m_data.size());
+    }
+    m_cpuDirty.fill(0);
+    const int base = m_base;
+    const int size = m_size;
+    for (int i = 0; i < starts.size() && i < lens.size(); ++i) {
+        const int64_t absStart = static_cast<int64_t>(starts[i]);
+        const int64_t absEnd   = absStart + static_cast<int64_t>(lens[i]); // exclusive
+        const int64_t relStart = absStart - base;
+        const int64_t relEnd   = absEnd - base;
+        const int64_t from = std::max<int64_t>(0, relStart);
+        const int64_t to   = std::min<int64_t>(size, relEnd);
+        if (from < to) {
+            memset(m_cpuDirty.data() + from, 1, static_cast<size_t>(to - from));
+        }
+    }
+    viewport()->update();
 }
 
 void HexWidget::scroll(int value) {
@@ -82,6 +111,37 @@ void HexWidget::scroll(int value) {
         }
     }
     verticalScrollBar()->blockSignals(false);
+}
+
+void HexWidget::applyCpuBytesAbs(const QVector<uint32_t> &starts, const QVector<uint32_t> &lens, const QByteArray &data) {
+    if (m_data.isEmpty()) {
+        return;
+    }
+    if (m_cpuDirty.size() != m_data.size()) {
+        m_cpuDirty.resize(m_data.size());
+        m_cpuDirty.fill(0);
+    }
+    const int base = m_base;
+    const int size = m_size;
+    const char *src = data.constData();
+    int srcOff = 0;
+    for (int i = 0; i < starts.size() && i < lens.size(); ++i) {
+        const int64_t absStart = static_cast<int64_t>(starts[i]);
+        const int64_t len = static_cast<int64_t>(lens[i]);
+        const int64_t absEnd = absStart + len;
+        const int64_t relStart = absStart - base;
+        const int64_t relEnd = absEnd - base;
+        const int64_t from = std::max<int64_t>(0, relStart);
+        const int64_t to = std::min<int64_t>(size, relEnd);
+        if (from < to) {
+            const int64_t copyOff = from - relStart; // how far into this span we start
+            const int64_t copyLen = to - from;
+            memcpy(m_data.data() + from, src + srcOff + copyOff, static_cast<size_t>(copyLen));
+            memset(m_cpuDirty.data() + from, 1, static_cast<size_t>(copyLen));
+        }
+        srcOff += static_cast<int>(len);
+    }
+    viewport()->update();
 }
 
 int HexWidget::indexPrevOf(const QByteArray &ba) {
@@ -371,13 +431,14 @@ void HexWidget::paintEvent(QPaintEvent *event) {
             uint8_t flags = debug.addr[addr + m_base];
             bool selected = addr >= m_selectStart && addr <= m_selectEnd;
             bool modified = !m_modified.isEmpty() && m_modified[addr];
+            bool cpuDirty = !m_cpuDirty.isEmpty() && m_cpuDirty[addr];
             const bool highlighted = m_highlightedAddr >= 0 && (m_base + addr) == m_highlightedAddr;
             const int xDataStart = xData;
             const int xAsciiStart = xAscii;
             QRect dataHighlightRect;
             QRect asciiHighlightRect;
 
-            if (highlighted) {
+            if (highlighted || cpuDirty) {
                 if (!col) {
                     dataHighlightRect.setRect(xDataStart, y - m_charHeight + m_margin, 2 * m_charWidth + 3, m_charHeight);
                 } else {
@@ -416,7 +477,7 @@ void HexWidget::paintEvent(QPaintEvent *event) {
                 painter.fillRect(r, modified ? selected ? cBoth : cModified : cSelected);
             }
 
-            if (highlighted) {
+            if (highlighted || cpuDirty) {
                 drawHighlightBox(dataHighlightRect);
             }
 
@@ -444,7 +505,7 @@ void HexWidget::paintEvent(QPaintEvent *event) {
                     r.setRect(xAscii, y - m_charHeight + m_margin, m_charWidth, m_charHeight);
                     painter.fillRect(r, modified ? selected ? cBoth : cModified : cSelected);
                 }
-                if (highlighted) {
+                if (highlighted || cpuDirty) {
                     drawHighlightBox(asciiHighlightRect);
                 }
                 painter.drawText(xAscii, y, QChar(ch));
